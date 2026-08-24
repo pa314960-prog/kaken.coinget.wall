@@ -56,6 +56,10 @@ maskCanvas.width = PROC_W;
 maskCanvas.height = PROC_H;
 const maskCtx = maskCanvas.getContext("2d");
 
+// プレイ中に表示する「ステージ背景」（実写カメラ映像の代わりに表示する）
+const stageCanvas = document.createElement("canvas");
+const stageCtx = stageCanvas.getContext("2d");
+
 // ---------------------------------------------------------------------------
 // 状態
 // ---------------------------------------------------------------------------
@@ -136,7 +140,42 @@ function resizeCanvasToVideo() {
   if (w && h) {
     els.canvas.width = w;
     els.canvas.height = h;
+    buildStageBackground(w, h);
   }
+}
+
+/**
+ * USJ「クッパJr.ファイナルバトル」のように、実写カメラ映像の代わりに
+ * 暗いステージ背景を表示するための背景画像を一度だけ作って使い回す。
+ */
+function buildStageBackground(w, h) {
+  stageCanvas.width = w;
+  stageCanvas.height = h;
+
+  const base = stageCtx.createRadialGradient(
+    w / 2, h * 0.15, h * 0.1,
+    w / 2, h * 0.65, h * 1.15
+  );
+  base.addColorStop(0, "#3a1550");
+  base.addColorStop(0.55, "#20102f");
+  base.addColorStop(1, "#0a0512");
+  stageCtx.fillStyle = base;
+  stageCtx.fillRect(0, 0, w, h);
+
+  // 洞窟の壁のような縦縞模様
+  const stripeCount = 14;
+  const stripeW = w / stripeCount;
+  for (let i = 0; i < stripeCount; i++) {
+    stageCtx.fillStyle = i % 2 === 0 ? "rgba(255,255,255,0.035)" : "rgba(0,0,0,0.10)";
+    stageCtx.fillRect(i * stripeW, 0, stripeW * 0.6, h);
+  }
+
+  // 上方からのふんわりした光
+  const glow = stageCtx.createRadialGradient(w / 2, h * 0.08, 0, w / 2, h * 0.08, h * 0.55);
+  glow.addColorStop(0, "rgba(255,205,120,0.22)");
+  glow.addColorStop(1, "rgba(255,205,120,0)");
+  stageCtx.fillStyle = glow;
+  stageCtx.fillRect(0, 0, w, h);
 }
 
 async function startCamera() {
@@ -294,6 +333,11 @@ function isSilhouetteAt(x, y, r) {
 // ---------------------------------------------------------------------------
 // Stage 3: ゲームロジック（落下物・当たり判定・スコア・タイマー）
 // ---------------------------------------------------------------------------
+
+// 影の色（USJのように、状態によって影の色が変わる）
+const SILHOUETTE_COLOR_NORMAL = [255, 70, 140];
+const SILHOUETTE_COLOR_BIG = [255, 213, 61];
+const SILHOUETTE_COLOR_POWERDOWN = [255, 90, 90];
 
 const COIN_RADIUS = 22;
 const ENEMY_RADIUS = 24;
@@ -484,6 +528,32 @@ function drawMaskOverlayIfNeeded() {
   ctx.restore();
 }
 
+function drawStageBackground() {
+  ctx.drawImage(stageCanvas, 0, 0, els.canvas.width, els.canvas.height);
+}
+
+/**
+ * USJ「クッパJr.ファイナルバトル」のように、実写映像は見せず、
+ * 背景差分マスクから抽出した輪郭だけを光る影として描画する。
+ */
+function drawSilhouetteShadow() {
+  if (!silhouetteMask) return;
+  const [r, g, b] = isPoweredDown()
+    ? SILHOUETTE_COLOR_POWERDOWN
+    : isBig()
+    ? SILHOUETTE_COLOR_BIG
+    : SILHOUETTE_COLOR_NORMAL;
+
+  renderMaskOverlay([r, g, b, 235]);
+  ctx.save();
+  ctx.imageSmoothingEnabled = true; // 拡大時に輪郭をなめらかにする
+  ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.85)`;
+  ctx.shadowBlur = 26;
+  ctx.drawImage(maskCanvas, 0, 0, els.canvas.width, els.canvas.height);
+  ctx.shadowBlur = 0;
+  ctx.restore();
+}
+
 function tick(t) {
   if (!els.video.videoWidth) {
     rafId = requestAnimationFrame(tick);
@@ -516,8 +586,15 @@ function tick(t) {
 }
 
 function drawFrame() {
-  drawMirroredCameraFrame();
-  drawMaskOverlayIfNeeded();
+  if (gameState === "playing" || gameState === "gameover") {
+    // プレイ中〜終了後は実写映像を見せず、影(シルエット)だけを表示する
+    drawStageBackground();
+    drawSilhouetteShadow();
+  } else {
+    // カメラ確認〜背景記憶の準備段階は、位置合わせのため実写映像を表示する
+    drawMirroredCameraFrame();
+    drawMaskOverlayIfNeeded();
+  }
   if (gameState === "playing") {
     drawFallingObjects();
   }
