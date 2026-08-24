@@ -146,36 +146,53 @@ function resizeCanvasToVideo() {
 
 /**
  * USJ「クッパJr.ファイナルバトル」のように、実写カメラ映像の代わりに
- * 暗いステージ背景を表示するための背景画像を一度だけ作って使い回す。
+ * 明るい逆光スクリーン風の背景を表示するための背景画像を
+ * 一度だけ作って使い回す。プレイヤーはこの上に「黒い影」として抜かれる。
  */
 function buildStageBackground(w, h) {
   stageCanvas.width = w;
   stageCanvas.height = h;
 
+  // 逆光のスクリーンを思わせる暖色（オレンジ）のグラデーション
   const base = stageCtx.createRadialGradient(
-    w / 2, h * 0.15, h * 0.1,
-    w / 2, h * 0.65, h * 1.15
+    w / 2, h * 0.42, h * 0.05,
+    w / 2, h * 0.5, h * 1.2
   );
-  base.addColorStop(0, "#3a1550");
-  base.addColorStop(0.55, "#20102f");
-  base.addColorStop(1, "#0a0512");
+  base.addColorStop(0, "#ffc070");
+  base.addColorStop(0.45, "#f4782c");
+  base.addColorStop(1, "#93300f");
   stageCtx.fillStyle = base;
   stageCtx.fillRect(0, 0, w, h);
 
-  // 洞窟の壁のような縦縞模様
-  const stripeCount = 14;
+  // 背後から差し込む「光の柱」（縦縞）
+  const stripeCount = 13;
   const stripeW = w / stripeCount;
   for (let i = 0; i < stripeCount; i++) {
-    stageCtx.fillStyle = i % 2 === 0 ? "rgba(255,255,255,0.035)" : "rgba(0,0,0,0.10)";
-    stageCtx.fillRect(i * stripeW, 0, stripeW * 0.6, h);
+    const x = i * stripeW;
+    const g = stageCtx.createLinearGradient(x, 0, x + stripeW * 0.72, 0);
+    g.addColorStop(0, "rgba(255,230,180,0)");
+    g.addColorStop(
+      0.5,
+      i % 2 === 0 ? "rgba(255,238,200,0.30)" : "rgba(180,50,10,0.20)"
+    );
+    g.addColorStop(1, "rgba(255,230,180,0)");
+    stageCtx.fillStyle = g;
+    stageCtx.fillRect(x, 0, stripeW * 0.72, h);
   }
 
-  // 上方からのふんわりした光
-  const glow = stageCtx.createRadialGradient(w / 2, h * 0.08, 0, w / 2, h * 0.08, h * 0.55);
-  glow.addColorStop(0, "rgba(255,205,120,0.22)");
-  glow.addColorStop(1, "rgba(255,205,120,0)");
-  stageCtx.fillStyle = glow;
-  stageCtx.fillRect(0, 0, w, h);
+  // ところどころに滲む光の玉（写真のような照明のボケ）
+  const blobs = [
+    [w * 0.08, h * 0.12, h * 0.30, "rgba(255,240,190,0.22)"],
+    [w * 0.82, h * 0.20, h * 0.34, "rgba(180,255,190,0.14)"],
+    [w * 0.60, h * 0.80, h * 0.40, "rgba(255,200,120,0.16)"],
+  ];
+  for (const [bx, by, br, color] of blobs) {
+    const g = stageCtx.createRadialGradient(bx, by, 0, bx, by, br);
+    g.addColorStop(0, color);
+    g.addColorStop(1, "rgba(255,255,255,0)");
+    stageCtx.fillStyle = g;
+    stageCtx.fillRect(0, 0, w, h);
+  }
 }
 
 async function startCamera() {
@@ -334,10 +351,15 @@ function isSilhouetteAt(x, y, r) {
 // Stage 3: ゲームロジック（落下物・当たり判定・スコア・タイマー）
 // ---------------------------------------------------------------------------
 
-// 影の色（USJのように、状態によって影の色が変わる）
-const SILHOUETTE_COLOR_NORMAL = [255, 70, 140];
-const SILHOUETTE_COLOR_BIG = [255, 213, 61];
-const SILHOUETTE_COLOR_POWERDOWN = [255, 90, 90];
+// 影そのものの色（USJのように、逆光でほぼ真っ黒に抜けるシルエット）
+const SILHOUETTE_COLOR_NORMAL = [14, 6, 10];
+const SILHOUETTE_COLOR_BIG = [38, 24, 0];
+const SILHOUETTE_COLOR_POWERDOWN = [46, 6, 6];
+
+// 影の周囲ににじむ光の色（状態が一目で分かるようにする）
+const SILHOUETTE_GLOW_NORMAL = [255, 170, 90];
+const SILHOUETTE_GLOW_BIG = [255, 213, 61];
+const SILHOUETTE_GLOW_POWERDOWN = [255, 70, 70];
 
 const COIN_RADIUS = 22;
 const ENEMY_RADIUS = 24;
@@ -470,25 +492,52 @@ function updateFallingObjects(dtMs) {
   }
 }
 
+/**
+ * 絵文字を「黒いシルエット」に変換した画像を作って使い回す。
+ * source-in 合成で、絵文字が描かれた部分だけを暗い色で塗りつぶしている。
+ */
+const silhouetteSpriteCache = new Map();
+function getSilhouetteSprite(emoji, size) {
+  const key = `${emoji}@${size}`;
+  const cached = silhouetteSpriteCache.get(key);
+  if (cached) return cached;
+
+  const c = document.createElement("canvas");
+  c.width = c.height = Math.ceil(size * 1.6);
+  const cc = c.getContext("2d");
+  cc.font = `${size}px sans-serif`;
+  cc.textAlign = "center";
+  cc.textBaseline = "middle";
+  cc.fillText(emoji, c.width / 2, c.height / 2);
+  cc.globalCompositeOperation = "source-in";
+  cc.fillStyle = "rgba(16,6,10,0.92)";
+  cc.fillRect(0, 0, c.width, c.height);
+
+  silhouetteSpriteCache.set(key, c);
+  return c;
+}
+
 function drawFallingObjects() {
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   for (const obj of fallingObjects) {
     if (obj.type === "coin") {
+      // コインは取りに行く目標なので、明るい背景でも目立つように光らせる
       const big = isBig();
+      ctx.save();
       ctx.font = big ? "42px sans-serif" : "34px sans-serif";
-      if (big) {
-        ctx.save();
-        ctx.shadowColor = "#ffd53d";
-        ctx.shadowBlur = 18;
-        ctx.fillText("🪙", obj.x, obj.y);
-        ctx.restore();
-      } else {
-        ctx.fillText("🪙", obj.x, obj.y);
-      }
+      ctx.shadowColor = big ? "rgba(255,255,255,0.95)" : "rgba(60,16,0,0.85)";
+      ctx.shadowBlur = big ? 22 : 14;
+      ctx.fillText("🪙", obj.x, obj.y);
+      ctx.restore();
     } else {
-      ctx.font = "36px sans-serif";
-      ctx.fillText("👾", obj.x, obj.y);
+      // 敵は USJ の映像同様、背景に落ちる黒い影として描く
+      const sprite = getSilhouetteSprite("👾", 36);
+      ctx.save();
+      ctx.shadowColor = "rgba(255,170,90,0.6)";
+      ctx.shadowBlur = 16;
+      ctx.drawImage(sprite, obj.x - sprite.width / 2, obj.y - sprite.height / 2);
+      ctx.restore();
     }
   }
 }
@@ -534,7 +583,8 @@ function drawStageBackground() {
 
 /**
  * USJ「クッパJr.ファイナルバトル」のように、実写映像は見せず、
- * 背景差分マスクから抽出した輪郭だけを光る影として描画する。
+ * 背景差分マスクから抽出した輪郭を「逆光で黒く抜けた影」として描画する。
+ * 影自体はほぼ真っ黒にし、輪郭のまわりに光を滲ませて逆光らしさを出す。
  */
 function drawSilhouetteShadow() {
   if (!silhouetteMask) return;
@@ -543,12 +593,17 @@ function drawSilhouetteShadow() {
     : isBig()
     ? SILHOUETTE_COLOR_BIG
     : SILHOUETTE_COLOR_NORMAL;
+  const [gr, gg, gb] = isPoweredDown()
+    ? SILHOUETTE_GLOW_POWERDOWN
+    : isBig()
+    ? SILHOUETTE_GLOW_BIG
+    : SILHOUETTE_GLOW_NORMAL;
 
-  renderMaskOverlay([r, g, b, 235]);
+  renderMaskOverlay([r, g, b, 242]);
   ctx.save();
   ctx.imageSmoothingEnabled = true; // 拡大時に輪郭をなめらかにする
-  ctx.shadowColor = `rgba(${r}, ${g}, ${b}, 0.85)`;
-  ctx.shadowBlur = 26;
+  ctx.shadowColor = `rgba(${gr}, ${gg}, ${gb}, 0.75)`;
+  ctx.shadowBlur = 30;
   ctx.drawImage(maskCanvas, 0, 0, els.canvas.width, els.canvas.height);
   ctx.shadowBlur = 0;
   ctx.restore();

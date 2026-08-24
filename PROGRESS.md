@@ -59,12 +59,21 @@
 ## USJ風の影表示（追加実装）
 
 - プレイ中〜ゲーム終了後は `drawMirroredCameraFrame` を呼ばず、代わりに
-  `drawStageBackground`（グラデーション+縦縞の暗いステージ背景。
-  `buildStageBackground` でキャンバスサイズ確定時に一度だけ生成し
-  使い回す）と `drawSilhouetteShadow`（背景差分マスクを状態に応じた
-  色 [通常はピンク / BIG中は金 / パワーダウン中は赤] で塗り、
-  `shadowBlur` で発光させた「影」として描画）を呼ぶように変更した。
+  `drawStageBackground` と `drawSilhouetteShadow` を呼ぶように変更した。
   実写カメラ映像そのものはプレイ中に一切表示されない。
+- 実際の USJ の映像に合わせ、「明るい逆光スクリーンの上に、自分が
+  真っ黒なシルエットとして抜ける」表現にしている。
+  - `buildStageBackground`: オレンジ系の明るいグラデーション +
+    背後から差し込む「光の柱」（縦縞）+ 照明のボケ（光の玉）。
+    キャンバスサイズ確定時に一度だけ生成して使い回す。
+  - `drawSilhouetteShadow`: 背景差分マスクを `SILHOUETTE_COLOR_*`
+    （ほぼ黒。BIG中はやや金寄り / パワーダウン中は赤黒）で塗り、
+    `shadowColor` に `SILHOUETTE_GLOW_*`（通常は暖色 / BIG中は金 /
+    パワーダウン中は赤）を指定して輪郭のまわりに光を滲ませる。
+  - 敵(👾)は `getSilhouetteSprite` で絵文字を黒いシルエットに変換して
+    描画する（`source-in` 合成。生成結果はキャッシュして使い回す）。
+    コイン(🪙)は取りに行く目標なので、明るい背景でも目立つように
+    `shadowBlur` で光らせたまま残している。
 - プレイ開始前（カメラ確認〜背景記憶）は引き続き実写映像を表示し、
   位置合わせや感度調整をしやすくしている。
 
