@@ -501,12 +501,10 @@ function tick(t) {
     if (timeLeftMs <= 0) {
       timeLeftMs = 0;
       updateFallingObjects(0);
-      drawFrame();
-      updateHud();
       endGame();
-      return;
+    } else {
+      updateFallingObjects(dtMs);
     }
-    updateFallingObjects(dtMs);
   }
 
   drawFrame();
