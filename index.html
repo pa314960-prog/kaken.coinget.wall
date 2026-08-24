@@ -26,6 +26,7 @@
   h1 {
     font-size: 1.2rem;
     margin: 0 0 12px;
+    text-align: center;
   }
   #stage {
     position: relative;
@@ -45,6 +46,58 @@
     width: 100%;
     height: 100%;
     display: block;
+  }
+  #hud {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    display: flex;
+    justify-content: space-between;
+    font-size: 1.1rem;
+    font-weight: bold;
+    text-shadow: 0 0 6px #000, 0 0 6px #000;
+    pointer-events: none;
+  }
+  #hud .big-badge {
+    color: #ffd53d;
+    display: none;
+  }
+  #hud.big .big-badge {
+    display: inline;
+  }
+  #hud .power-badge {
+    color: #ff6b6b;
+    display: none;
+    margin-left: 8px;
+  }
+  #hud.powerdown .power-badge {
+    display: inline;
+  }
+  #overlayPanel {
+    position: absolute;
+    inset: 0;
+    display: none;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 12px;
+    background: rgba(0, 0, 0, 0.72);
+    text-align: center;
+    padding: 16px;
+    box-sizing: border-box;
+  }
+  #overlayPanel.visible {
+    display: flex;
+  }
+  #overlayPanel h2 {
+    margin: 0;
+    font-size: 1.4rem;
+  }
+  #overlayPanel p {
+    margin: 0;
+    max-width: 480px;
+    line-height: 1.6;
   }
   #status {
     margin-top: 10px;
@@ -75,22 +128,88 @@
   button:hover:not(:disabled) {
     background: #1c63d6;
   }
+  button.secondary {
+    background: #444;
+  }
+  button.secondary:hover:not(:disabled) {
+    background: #333;
+  }
   .error {
     color: #ff6b6b;
+  }
+  #sliders {
+    margin-top: 14px;
+    width: 100%;
+    max-width: 480px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .slider-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    font-size: 0.9rem;
+  }
+  .slider-row label {
+    flex: 0 0 auto;
+    width: 8.5em;
+  }
+  .slider-row input[type="range"] {
+    flex: 1 1 auto;
+  }
+  .slider-row .val {
+    flex: 0 0 auto;
+    width: 3.5em;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 0.9rem;
   }
 </style>
 </head>
 <body>
 <div id="app">
-  <h1>シルエットコインゲット — Step 1: カメラ映像（鏡像表示）</h1>
+  <h1>シルエットコインゲット — 影で落ちてくるコインをキャッチ！</h1>
   <div id="stage">
     <video id="cam" autoplay playsinline muted></video>
     <canvas id="view"></canvas>
+    <div id="hud">
+      <span>スコア: <span id="scoreVal">0</span> <span class="big-badge">BIG!</span><span class="power-badge">パワーダウン中</span></span>
+      <span>残り: <span id="timeVal">60</span>秒</span>
+    </div>
+    <div id="overlayPanel">
+      <h2 id="overlayTitle"></h2>
+      <p id="overlayText"></p>
+      <div id="overlayButtons"></div>
+    </div>
   </div>
   <div id="status">カメラを開始するにはボタンを押してください。</div>
   <div id="controls">
-    <button id="startBtn">カメラ開始</button>
+    <button id="startBtn">① カメラ開始</button>
     <button id="stopBtn" disabled>カメラ停止</button>
+    <button id="bgBtn" disabled>② 背景を記憶（画面から外れてから押す）</button>
+    <button id="playBtn" disabled>③ ゲーム開始（60秒）</button>
+  </div>
+  <div id="sliders">
+    <div class="slider-row">
+      <label for="sensitivity">感度</label>
+      <input type="range" id="sensitivity" min="5" max="80" value="30" step="1">
+      <span class="val" id="sensitivityVal">30</span>
+    </div>
+    <div class="slider-row">
+      <label for="fallSpeed">落下速度</label>
+      <input type="range" id="fallSpeed" min="50" max="300" value="100" step="5">
+      <span class="val" id="fallSpeedVal">100%</span>
+    </div>
+    <div class="checkbox-row">
+      <input type="checkbox" id="maskToggle">
+      <label for="maskToggle">シルエットマスクを表示（デバッグ用）</label>
+    </div>
   </div>
 </div>
 
