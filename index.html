@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>シルエットコインゲット</title>
+<title>シルエットコインたたき</title>
 <style>
   :root {
     color-scheme: dark;
@@ -64,14 +64,6 @@
     display: none;
   }
   #hud.big .big-badge {
-    display: inline;
-  }
-  #hud .power-badge {
-    color: #ff6b6b;
-    display: none;
-    margin-left: 8px;
-  }
-  #hud.powerdown .power-badge {
     display: inline;
   }
   #overlayPanel {
@@ -174,12 +166,12 @@
 </head>
 <body>
 <div id="app">
-  <h1>シルエットコインゲット — 影で落ちてくるコインをキャッチ！</h1>
+  <h1>シルエットコインたたき — 落ちてくるコインを手で弾き飛ばせ！</h1>
   <div id="stage">
     <video id="cam" autoplay playsinline muted></video>
     <canvas id="view"></canvas>
     <div id="hud">
-      <span>スコア: <span id="scoreVal">0</span> <span class="big-badge">BIG!</span><span class="power-badge">パワーダウン中</span></span>
+      <span>スコア: <span id="scoreVal">0</span> <span class="big-badge">BIG!</span></span>
       <span>残り: <span id="timeVal">60</span>秒</span>
     </div>
     <div id="overlayPanel">

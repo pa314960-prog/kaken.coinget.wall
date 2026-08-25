@@ -9,7 +9,7 @@
  *   Stage 3: ゲームロジック（落下物・当たり判定・スコア・タイマー・スライダー）
  *
  * ビルド不要の Vanilla JS のみで構成。外部ライブラリ・画像素材を使わず、
- * 絵文字と canvas 描画だけでコイン/敵を表現しているため、
+ * 絵文字と canvas 描画だけでコインを表現しているため、
  * ローカル HTTP サーバー + 最新ブラウザだけでどの PC でも動作する。
  */
 
@@ -73,6 +73,7 @@ let gameState = "idle";
 
 let backgroundLuma = null; // Uint8Array(PROC_W*PROC_H) 背景の輝度
 let silhouetteMask = null; // Uint8Array(PROC_W*PROC_H) 1=シルエットあり
+let prevSilhouetteMask = null; // 1フレーム前のマスク（手の動きの検出に使う）
 
 // 感度: 値が小さいほど敏感（わずかな差分でも反応する）
 let sensitivityThreshold = Number(els.sensitivity.value);
@@ -83,13 +84,13 @@ let showMask = els.maskToggle.checked;
 const GAME_DURATION_SEC = 60;
 let timeLeftMs = GAME_DURATION_SEC * 1000;
 let score = 0;
-let coinsCollected = 0; // BIG 判定用の累計コイン数
+let totalHits = 0; // 弾いた回数の合計（BIG 判定にも使う）
+let bestCombo = 0; // 1枚のコインを落とさず連続で弾けた最高回数
 let bigUntil = 0; // performance.now() ベースのタイムスタンプ
-let powerDownUntil = 0;
 
 let fallingObjects = [];
 let spawnCoinTimerMs = 0;
-let spawnEnemyTimerMs = 0;
+let hitEffects = []; // 弾いた瞬間のエフェクト（広がる輪 + 得点表示）
 
 // ---------------------------------------------------------------------------
 // ユーティリティ
@@ -296,7 +297,15 @@ function updateSilhouetteMask() {
   const cur = captureMirroredLuma();
   if (!silhouetteMask) {
     silhouetteMask = new Uint8Array(PROC_W * PROC_H);
+    prevSilhouetteMask = new Uint8Array(PROC_W * PROC_H);
   }
+
+  // 手の動きを検出するために1フレーム前のマスクを残しておく。
+  // 毎フレーム確保しないよう、2つのバッファを入れ替えて使い回す。
+  const recycled = prevSilhouetteMask;
+  prevSilhouetteMask = silhouetteMask;
+  silhouetteMask = recycled;
+
   for (let p = 0; p < cur.length; p++) {
     const diff = Math.abs(cur[p] - backgroundLuma[p]);
     silhouetteMask[p] = diff > sensitivityThreshold ? 1 : 0;
@@ -524,30 +533,113 @@ function renderMaskOverlay(color) {
   maskCtx.putImageData(imgData, 0, 0);
 }
 
+// 触れたと判定するのに必要な、円内のシルエット被覆率
+const TOUCH_COVERAGE = 0.22;
+// 動きを見る範囲は、当たり判定の何倍の広さにするか。
+// 手はコインより大きいことが多く、判定円と同じ広さだと手が範囲を覆い尽くして
+// しまい「動いていない」と誤判定される。手の“ふち”が入る広さが必要。
+const MOTION_RADIUS_MUL = 3.2;
+// この割合だけ画素が入れ替わっていれば「最大の勢い」とみなす
+const MOTION_FULL_POWER_RATIO = 0.45;
+
 /**
- * 指定した本画面座標(x, y)・半径rの円内で、シルエットマスクが
- * 一定割合以上シルエット判定されているかを調べる（当たり判定用）。
+ * 指定した本画面座標(x, y)・半径 r の円内を調べ、
+ * 「シルエットが触れているか」と「手がどちら向きにどれくらいの勢いで
+ * 動いたか」を返す。
+ *
+ * 触れたかどうかは半径 r の内側で判定するが、動きの検出は
+ * その MOTION_RADIUS_MUL 倍の広い円で行う。判定円と同じ広さで見ると、
+ * コインより大きい手が円を覆い尽くしたときに画素の出入りが起きず、
+ * 「動いていない」と誤判定されてしまうため。
+ *
+ * 動きの向きは、前フレームには無く今フレームに現れた画素（手が入ってきた側）
+ * の重心と、前フレームにあって今フレームで消えた画素（手が抜けた側）の重心の
+ * 差から求める。勢いは、入れ替わった画素の割合から求める。
  */
-function isSilhouetteAt(x, y, r) {
-  if (!silhouetteMask) return false;
+function measureSilhouetteMotionAt(x, y, r) {
+  const result = { touching: false, dirX: 0, dirY: 0, power: 0 };
+  if (!silhouetteMask) return result;
+
   const sx = PROC_W / els.canvas.width;
   const sy = PROC_H / els.canvas.height;
   const px = x * sx;
   const py = y * sy;
-  const pr = Math.max(1, r * ((sx + sy) / 2));
+  const touchR = Math.max(2, r * ((sx + sy) / 2));
+  const touchR2 = touchR * touchR;
+  const motionR = touchR * MOTION_RADIUS_MUL;
+  const motionR2 = motionR * motionR;
 
-  let hits = 0;
-  let total = 0;
-  const samples = 9;
-  for (let i = 0; i < samples; i++) {
-    const ang = (i / samples) * Math.PI * 2;
-    const rad = i === 0 ? 0 : pr * 0.6;
-    const sxp = clamp(Math.round(px + Math.cos(ang) * rad), 0, PROC_W - 1);
-    const syp = clamp(Math.round(py + Math.sin(ang) * rad), 0, PROC_H - 1);
-    total++;
-    if (silhouetteMask[syp * PROC_W + sxp]) hits++;
+  const x0 = clamp(Math.floor(px - motionR), 0, PROC_W - 1);
+  const x1 = clamp(Math.ceil(px + motionR), 0, PROC_W - 1);
+  const y0 = clamp(Math.floor(py - motionR), 0, PROC_H - 1);
+  const y1 = clamp(Math.ceil(py + motionR), 0, PROC_H - 1);
+
+  let touchTotal = 0;
+  let covered = 0;
+  let motionTotal = 0;
+  let appearedX = 0, appearedY = 0, appearedN = 0;
+  let vanishedX = 0, vanishedY = 0, vanishedN = 0;
+
+  for (let yy = y0; yy <= y1; yy++) {
+    for (let xx = x0; xx <= x1; xx++) {
+      const dx = xx - px;
+      const dy = yy - py;
+      const d2 = dx * dx + dy * dy;
+      if (d2 > motionR2) continue;
+
+      const p = yy * PROC_W + xx;
+      const cur = silhouetteMask[p];
+      const prev = prevSilhouetteMask ? prevSilhouetteMask[p] : 0;
+
+      // 触れたかどうかは内側の小さい円だけで判定する
+      if (d2 <= touchR2) {
+        touchTotal++;
+        if (cur) covered++;
+      }
+
+      motionTotal++;
+      if (cur && !prev) {
+        appearedX += dx;
+        appearedY += dy;
+        appearedN++;
+      } else if (!cur && prev) {
+        vanishedX += dx;
+        vanishedY += dy;
+        vanishedN++;
+      }
+    }
   }
-  return hits / total >= 0.4;
+
+  if (touchTotal === 0 || motionTotal === 0) return result;
+  result.touching = covered / touchTotal >= TOUCH_COVERAGE;
+  if (!result.touching) return result;
+
+  // 「消えた側 → 現れた側」が手の進行方向
+  let mx = 0;
+  let my = 0;
+  if (appearedN > 0 && vanishedN > 0) {
+    mx = appearedX / appearedN - vanishedX / vanishedN;
+    my = appearedY / appearedN - vanishedY / vanishedN;
+  } else if (appearedN > 0) {
+    mx = appearedX / appearedN;
+    my = appearedY / appearedN;
+  } else if (vanishedN > 0) {
+    mx = -vanishedX / vanishedN;
+    my = -vanishedY / vanishedN;
+  }
+
+  // マスクは横長に縮小されているので、本画面のアスペクト比に戻してから正規化する
+  mx /= sx;
+  my /= sy;
+  const len = Math.hypot(mx, my);
+  if (len > 0.0001) {
+    result.dirX = mx / len;
+    result.dirY = my / len;
+  }
+
+  const changeRatio = (appearedN + vanishedN) / motionTotal;
+  result.power = clamp(changeRatio / MOTION_FULL_POWER_RATIO, 0, 1);
+  return result;
 }
 
 // ---------------------------------------------------------------------------
@@ -557,57 +649,62 @@ function isSilhouetteAt(x, y, r) {
 // 影そのものの色（USJのように、逆光でほぼ真っ黒に抜けるシルエット）
 const SILHOUETTE_COLOR_NORMAL = [14, 6, 10];
 const SILHOUETTE_COLOR_BIG = [38, 24, 0];
-const SILHOUETTE_COLOR_POWERDOWN = [46, 6, 6];
 
 // 影の周囲ににじむ光の色（状態が一目で分かるようにする）
 const SILHOUETTE_GLOW_NORMAL = [255, 170, 90];
 const SILHOUETTE_GLOW_BIG = [255, 213, 61];
-const SILHOUETTE_GLOW_POWERDOWN = [255, 70, 70];
 
 const COIN_RADIUS = 22;
-const ENEMY_RADIUS = 24;
 const COIN_SCORE = 10;
-const ENEMY_PENALTY = 15;
-const BIG_EVERY_N_COINS = 10;
+const BIG_EVERY_N_HITS = 10;
 const BIG_DURATION_MS = 8000;
-const POWERDOWN_DURATION_MS = 3000;
+
+// --- 弾き飛ばしの調整値 -----------------------------------------------------
+// 重力加速度(px/秒^2)。落下速度スライダーの値で倍率をかける。
+const GRAVITY = 900;
+// 弾いたときに上へ跳ね上がる速さ(px/秒)。手をゆっくり動かしても
+// ちゃんと飛ぶよう、下限を大きめに取っている。
+const FLING_UP_MIN = 420;
+const FLING_UP_MAX = 900;
+// 手が動いた向きへ与える横方向の速さ(px/秒)
+const FLING_SIDE_MAX = 620;
+// 壁・天井で跳ね返るときに残る速度の割合
+const WALL_BOUNCE = 0.72;
+const CEIL_BOUNCE = 0.5;
+// 一度弾いてから、次に弾けるようになるまでの時間(ms)
+const HIT_COOLDOWN_MS = 260;
+// 空中コンボ倍率の上限
+const COMBO_MAX = 5;
+// 弾いたエフェクトの表示時間(ms)
+const HIT_EFFECT_MS = 700;
 
 function isBig() {
   return now() < bigUntil;
 }
-function isPoweredDown() {
-  return now() < powerDownUntil;
-}
 
 function spawnCoin() {
   fallingObjects.push({
-    type: "coin",
-    x: randRange(COIN_RADIUS + 10, els.canvas.width - COIN_RADIUS - 10),
+    x: randRange(COIN_RADIUS + 20, els.canvas.width - COIN_RADIUS - 20),
     y: -COIN_RADIUS,
     r: COIN_RADIUS,
-    speed: randRange(70, 110),
-  });
-}
-
-function spawnEnemy() {
-  fallingObjects.push({
-    type: "enemy",
-    x: randRange(ENEMY_RADIUS + 10, els.canvas.width - ENEMY_RADIUS - 10),
-    y: -ENEMY_RADIUS,
-    r: ENEMY_RADIUS,
-    speed: randRange(60, 100),
+    vx: randRange(-40, 40),
+    vy: randRange(60, 120),
+    hits: 0, // このコインを床に落とさず連続で弾けた回数
+    cooldownMs: 0,
+    spin: 0,
+    spinSpeed: 0,
   });
 }
 
 function resetGameState() {
   score = 0;
-  coinsCollected = 0;
+  totalHits = 0;
+  bestCombo = 0;
   bigUntil = 0;
-  powerDownUntil = 0;
   timeLeftMs = GAME_DURATION_SEC * 1000;
   fallingObjects = [];
+  hitEffects = [];
   spawnCoinTimerMs = 0;
-  spawnEnemyTimerMs = 0;
 }
 
 function startGame() {
@@ -617,7 +714,9 @@ function startGame() {
   hideOverlay();
   els.hud.style.display = "flex";
   els.playBtn.disabled = true;
-  setStatus("プレイ中！体を動かしてコインを影でキャッチしよう。敵には触れないように。");
+  setStatus(
+    "プレイ中！落ちてくるコインを手で弾き飛ばそう。勢いよく弾くほど高得点、床に落ちる前に空中で連続して弾くとコンボ！"
+  );
 }
 
 function endGame() {
@@ -625,7 +724,7 @@ function endGame() {
   els.hud.style.display = "flex";
   showOverlay(
     "ゲーム終了！",
-    `最終スコア: ${score} 点（コイン ${coinsCollected} 枚）`,
+    `最終スコア: ${score} 点（弾いた回数 ${totalHits} 回 / 最高コンボ ${bestCombo}）`,
     [
       {
         label: "もう一度プレイ",
@@ -650,98 +749,150 @@ function endGame() {
   );
 }
 
+/** コインを1枚弾き飛ばし、勢いとコンボに応じて得点を加える */
+function flingCoin(obj, motion) {
+  obj.hits++;
+  totalHits++;
+  if (obj.hits > bestCombo) bestCombo = obj.hits;
+
+  // 横方向は手が動いた向きへ、縦方向は必ず上向きに跳ね上げる。
+  // カメラ越しの操作では細かい向きを狙いにくいので、
+  // 「弾いたら上に飛ぶ」と決め打ちにした方が気持ちよく遊べる。
+  obj.vx = obj.vx * 0.35 + motion.dirX * FLING_SIDE_MAX * (0.35 + motion.power);
+  obj.vy = -(FLING_UP_MIN + (FLING_UP_MAX - FLING_UP_MIN) * motion.power);
+  obj.spinSpeed = (motion.dirX >= 0 ? 1 : -1) * (6 + motion.power * 16);
+  obj.cooldownMs = HIT_COOLDOWN_MS;
+
+  const combo = Math.min(obj.hits, COMBO_MAX);
+  const bigMul = isBig() ? 2 : 1;
+  const gained = Math.round(COIN_SCORE * (1 + motion.power) * combo * bigMul);
+  score += gained;
+
+  if (totalHits % BIG_EVERY_N_HITS === 0) {
+    bigUntil = now() + BIG_DURATION_MS;
+  }
+
+  hitEffects.push({
+    x: obj.x,
+    y: obj.y,
+    text: combo > 1 ? `+${gained}  x${combo}` : `+${gained}`,
+    ageMs: 0,
+  });
+}
+
 function updateFallingObjects(dtMs) {
+  const dt = dtMs / 1000;
   const speedMul = fallSpeedPercent / 100;
-  const poweredDown = isPoweredDown();
-  const big = isBig();
-  const hitRadiusMul = poweredDown ? 0.6 : 1; // パワーダウン中は当たり判定が小さくなる
+  const w = els.canvas.width;
+  const h = els.canvas.height;
 
   const next = [];
   for (const obj of fallingObjects) {
-    obj.y += obj.speed * speedMul * (dtMs / 1000);
+    if (obj.cooldownMs > 0) obj.cooldownMs -= dtMs;
 
-    const caught = isSilhouetteAt(obj.x, obj.y, obj.r * hitRadiusMul);
-    let remove = false;
+    // 物理更新（重力・移動・回転）
+    obj.vy += GRAVITY * speedMul * dt;
+    obj.x += obj.vx * dt;
+    obj.y += obj.vy * dt;
+    obj.spin += obj.spinSpeed * dt;
+    obj.spinSpeed *= 0.99;
 
-    if (caught && obj.type === "coin") {
-      coinsCollected++;
-      const mul = (big ? 2 : 1) * (poweredDown ? 0.5 : 1);
-      score += Math.round(COIN_SCORE * mul);
-      if (coinsCollected % BIG_EVERY_N_COINS === 0) {
-        bigUntil = now() + BIG_DURATION_MS;
-      }
-      remove = true;
-    } else if (caught && obj.type === "enemy") {
-      score = Math.max(0, score - ENEMY_PENALTY);
-      powerDownUntil = now() + POWERDOWN_DURATION_MS;
-      remove = true;
-    } else if (obj.y - obj.r > els.canvas.height) {
-      remove = true; // 画面外に落ちた
+    // 左右の壁と天井では跳ね返す。画面内に留まるので連続で弾きやすい。
+    if (obj.x < obj.r) {
+      obj.x = obj.r;
+      obj.vx = Math.abs(obj.vx) * WALL_BOUNCE;
+    } else if (obj.x > w - obj.r) {
+      obj.x = w - obj.r;
+      obj.vx = -Math.abs(obj.vx) * WALL_BOUNCE;
+    }
+    if (obj.y < obj.r) {
+      obj.y = obj.r;
+      obj.vy = Math.abs(obj.vy) * CEIL_BOUNCE;
     }
 
-    if (!remove) next.push(obj);
+    // 手で弾いたかどうかの判定
+    if (obj.cooldownMs <= 0) {
+      const motion = measureSilhouetteMotionAt(obj.x, obj.y, obj.r);
+      if (motion.touching) {
+        flingCoin(obj, motion);
+      }
+    }
+
+    // 床より下に落ちたら見逃し（そのコインのコンボはそこで終わり）
+    if (obj.y - obj.r > h) continue;
+    next.push(obj);
   }
   fallingObjects = next;
+
+  // エフェクトの寿命管理
+  const liveEffects = [];
+  for (const e of hitEffects) {
+    e.ageMs += dtMs;
+    if (e.ageMs < HIT_EFFECT_MS) liveEffects.push(e);
+  }
+  hitEffects = liveEffects;
 
   spawnCoinTimerMs -= dtMs;
   if (spawnCoinTimerMs <= 0) {
     spawnCoin();
-    spawnCoinTimerMs = randRange(500, 900);
+    spawnCoinTimerMs = randRange(700, 1200);
   }
-  spawnEnemyTimerMs -= dtMs;
-  if (spawnEnemyTimerMs <= 0) {
-    spawnEnemy();
-    spawnEnemyTimerMs = randRange(1200, 2000);
-  }
-}
-
-/**
- * 絵文字を「黒いシルエット」に変換した画像を作って使い回す。
- * source-in 合成で、絵文字が描かれた部分だけを暗い色で塗りつぶしている。
- */
-const silhouetteSpriteCache = new Map();
-function getSilhouetteSprite(emoji, size) {
-  const key = `${emoji}@${size}`;
-  const cached = silhouetteSpriteCache.get(key);
-  if (cached) return cached;
-
-  const c = document.createElement("canvas");
-  c.width = c.height = Math.ceil(size * 1.6);
-  const cc = c.getContext("2d");
-  cc.font = `${size}px sans-serif`;
-  cc.textAlign = "center";
-  cc.textBaseline = "middle";
-  cc.fillText(emoji, c.width / 2, c.height / 2);
-  cc.globalCompositeOperation = "source-in";
-  cc.fillStyle = "rgba(16,6,10,0.92)";
-  cc.fillRect(0, 0, c.width, c.height);
-
-  silhouetteSpriteCache.set(key, c);
-  return c;
 }
 
 function drawFallingObjects() {
+  const big = isBig();
   ctx.textAlign = "center";
   ctx.textBaseline = "middle";
   for (const obj of fallingObjects) {
-    if (obj.type === "coin") {
-      // コインは取りに行く目標なので、明るい背景でも目立つように光らせる
-      const big = isBig();
+    ctx.save();
+    ctx.translate(obj.x, obj.y);
+    ctx.rotate(obj.spin);
+    ctx.font = big ? "42px sans-serif" : "34px sans-serif";
+    // 明るい背景でも見失わないように光らせる
+    ctx.shadowColor = big ? "rgba(255,255,255,0.95)" : "rgba(60,16,0,0.85)";
+    ctx.shadowBlur = big ? 22 : 14;
+    ctx.fillText("🪙", 0, 0);
+    ctx.restore();
+
+    // 連続で弾いているコインには、今のコンボ倍率を添える
+    if (obj.hits >= 2) {
+      const label = `x${Math.min(obj.hits, COMBO_MAX)}`;
       ctx.save();
-      ctx.font = big ? "42px sans-serif" : "34px sans-serif";
-      ctx.shadowColor = big ? "rgba(255,255,255,0.95)" : "rgba(60,16,0,0.85)";
-      ctx.shadowBlur = big ? 22 : 14;
-      ctx.fillText("🪙", obj.x, obj.y);
-      ctx.restore();
-    } else {
-      // 敵は USJ の映像同様、背景に落ちる黒い影として描く
-      const sprite = getSilhouetteSprite("👾", 36);
-      ctx.save();
-      ctx.shadowColor = "rgba(255,170,90,0.6)";
-      ctx.shadowBlur = 16;
-      ctx.drawImage(sprite, obj.x - sprite.width / 2, obj.y - sprite.height / 2);
+      ctx.font = "bold 18px sans-serif";
+      ctx.fillStyle = "#fff";
+      ctx.strokeStyle = "rgba(60,16,0,0.9)";
+      ctx.lineWidth = 4;
+      ctx.strokeText(label, obj.x, obj.y + 30);
+      ctx.fillText(label, obj.x, obj.y + 30);
       ctx.restore();
     }
+  }
+}
+
+/** 弾いた瞬間の「広がる輪」と、獲得点数の浮き上がり表示 */
+function drawHitEffects() {
+  ctx.textAlign = "center";
+  ctx.textBaseline = "middle";
+  for (const e of hitEffects) {
+    const t = e.ageMs / HIT_EFFECT_MS; // 0 → 1
+    ctx.save();
+    ctx.globalAlpha = 1 - t;
+
+    ctx.strokeStyle = "rgba(255,255,255,0.95)";
+    ctx.lineWidth = 1 + 4 * (1 - t);
+    ctx.beginPath();
+    ctx.arc(e.x, e.y, 16 + t * 52, 0, Math.PI * 2);
+    ctx.stroke();
+
+    ctx.font = "bold 26px sans-serif";
+    ctx.fillStyle = "#fff";
+    ctx.strokeStyle = "rgba(60,16,0,0.9)";
+    ctx.lineWidth = 5;
+    // コインと重ならないよう、最初からコインの少し上に出す
+    const ty = e.y - 30 - t * 48;
+    ctx.strokeText(e.text, e.x, ty);
+    ctx.fillText(e.text, e.x, ty);
+    ctx.restore();
   }
 }
 
@@ -749,7 +900,6 @@ function updateHud() {
   els.scoreVal.textContent = String(score);
   els.timeVal.textContent = String(Math.max(0, Math.ceil(timeLeftMs / 1000)));
   els.hud.classList.toggle("big", isBig());
-  els.hud.classList.toggle("powerdown", isPoweredDown());
 }
 
 // ---------------------------------------------------------------------------
@@ -768,11 +918,7 @@ function drawMirroredCameraFrame() {
 
 function drawMaskOverlayIfNeeded() {
   if (!showMask || !silhouetteMask) return;
-  const color = isPoweredDown()
-    ? [255, 80, 80, 140]
-    : isBig()
-    ? [255, 213, 61, 140]
-    : [70, 220, 130, 140];
+  const color = isBig() ? [255, 213, 61, 140] : [70, 220, 130, 140];
   renderMaskOverlay(color);
   ctx.save();
   ctx.imageSmoothingEnabled = false;
@@ -791,16 +937,8 @@ function drawStageBackground() {
  */
 function drawSilhouetteShadow() {
   if (!silhouetteMask) return;
-  const [r, g, b] = isPoweredDown()
-    ? SILHOUETTE_COLOR_POWERDOWN
-    : isBig()
-    ? SILHOUETTE_COLOR_BIG
-    : SILHOUETTE_COLOR_NORMAL;
-  const [gr, gg, gb] = isPoweredDown()
-    ? SILHOUETTE_GLOW_POWERDOWN
-    : isBig()
-    ? SILHOUETTE_GLOW_BIG
-    : SILHOUETTE_GLOW_NORMAL;
+  const [r, g, b] = isBig() ? SILHOUETTE_COLOR_BIG : SILHOUETTE_COLOR_NORMAL;
+  const [gr, gg, gb] = isBig() ? SILHOUETTE_GLOW_BIG : SILHOUETTE_GLOW_NORMAL;
 
   renderMaskOverlay([r, g, b, 242]);
   ctx.save();
@@ -859,6 +997,7 @@ function drawFrame() {
   }
   if (gameState === "playing") {
     drawFallingObjects();
+    drawHitEffects();
   }
 }
 
