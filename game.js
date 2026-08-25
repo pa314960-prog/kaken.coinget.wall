@@ -301,6 +301,209 @@ function updateSilhouetteMask() {
     const diff = Math.abs(cur[p] - backgroundLuma[p]);
     silhouetteMask[p] = diff > sensitivityThreshold ? 1 : 0;
   }
+  refineSilhouetteMask();
+}
+
+// ---------------------------------------------------------------------------
+// マスク後処理
+//
+// 単純な背景差分だけだと、服や肌の明るさが背景とたまたま近い部分が「背景」と
+// 判定され、体の内側がまばらに抜けた影になってしまう。そこで
+//   1) クロージング（膨張→収縮）で、細かい抜けや途切れを繋ぐ
+//   2) 穴埋め（外周から到達できない 0 の領域＝体の内側の穴を塗る）
+//   3) 小さな孤立点の除去
+// を毎フレーム行い、「隙間のない一つの塊」にしてから描画・当たり判定に使う。
+// ---------------------------------------------------------------------------
+
+const MASK_CLOSE_RADIUS = 3; // 抜けを塞ぐ強さ（大きいほど影が太くなる）
+const MASK_MIN_BLOB_PX = 60; // これ未満の孤立した塊はノイズとして消す
+
+const maskWorkBuf = new Uint8Array(PROC_W * PROC_H);
+const maskVisited = new Uint8Array(PROC_W * PROC_H);
+const maskStack = new Int32Array(PROC_W * PROC_H);
+const maskBlobBuf = new Int32Array(PROC_W * PROC_H);
+
+function refineSilhouetteMask() {
+  // 1) 膨張してバラバラの断片を一つに繋ぐ → 内側の穴を埋める → 収縮して元の太さに戻す
+  dilateMask(silhouetteMask, MASK_CLOSE_RADIUS);
+  fillMaskHoles(silhouetteMask);
+  erodeMask(silhouetteMask, MASK_CLOSE_RADIUS);
+  // 2) 収縮で再び開いた穴を埋め直す
+  fillMaskHoles(silhouetteMask);
+  // 3) 体から離れた小さなノイズを消す
+  removeSmallBlobs(silhouetteMask, MASK_MIN_BLOB_PX);
+}
+
+/**
+ * 膨張（1 の領域を radius だけ広げる）。
+ * 横方向・縦方向に分けて、移動和で走査することで高速化している。
+ */
+function dilateMask(mask, radius) {
+  const w = PROC_W;
+  const h = PROC_H;
+
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let sum = 0;
+    for (let x = 0; x <= radius && x < w; x++) sum += mask[row + x];
+    for (let x = 0; x < w; x++) {
+      maskWorkBuf[row + x] = sum > 0 ? 1 : 0;
+      const out = x - radius;
+      const inn = x + radius + 1;
+      if (out >= 0) sum -= mask[row + out];
+      if (inn < w) sum += mask[row + inn];
+    }
+  }
+
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    for (let y = 0; y <= radius && y < h; y++) sum += maskWorkBuf[y * w + x];
+    for (let y = 0; y < h; y++) {
+      mask[y * w + x] = sum > 0 ? 1 : 0;
+      const out = y - radius;
+      const inn = y + radius + 1;
+      if (out >= 0) sum -= maskWorkBuf[out * w + x];
+      if (inn < h) sum += maskWorkBuf[inn * w + x];
+    }
+  }
+}
+
+/**
+ * 収縮（1 の領域を radius だけ削る）。画面の外側は判定に含めないので、
+ * 画面端に接している体が端で削れてしまうことはない。
+ */
+function erodeMask(mask, radius) {
+  const w = PROC_W;
+  const h = PROC_H;
+
+  for (let y = 0; y < h; y++) {
+    const row = y * w;
+    let sum = 0;
+    let count = 0;
+    for (let x = 0; x <= radius && x < w; x++) {
+      sum += mask[row + x];
+      count++;
+    }
+    for (let x = 0; x < w; x++) {
+      maskWorkBuf[row + x] = sum === count ? 1 : 0;
+      const out = x - radius;
+      const inn = x + radius + 1;
+      if (out >= 0) {
+        sum -= mask[row + out];
+        count--;
+      }
+      if (inn < w) {
+        sum += mask[row + inn];
+        count++;
+      }
+    }
+  }
+
+  for (let x = 0; x < w; x++) {
+    let sum = 0;
+    let count = 0;
+    for (let y = 0; y <= radius && y < h; y++) {
+      sum += maskWorkBuf[y * w + x];
+      count++;
+    }
+    for (let y = 0; y < h; y++) {
+      mask[y * w + x] = sum === count ? 1 : 0;
+      const out = y - radius;
+      const inn = y + radius + 1;
+      if (out >= 0) {
+        sum -= maskWorkBuf[out * w + x];
+        count--;
+      }
+      if (inn < h) {
+        sum += maskWorkBuf[inn * w + x];
+        count++;
+      }
+    }
+  }
+}
+
+/**
+ * 体の内側の穴を塗りつぶす。画面の外周から 0 を辿って「本当の背景」を塗り分け、
+ * どこからも到達できなかった 0 の領域＝内側の穴とみなして 1 にする。
+ */
+function fillMaskHoles(mask) {
+  const w = PROC_W;
+  const h = PROC_H;
+  maskVisited.fill(0);
+  let sp = 0;
+
+  const push = (p) => {
+    if (!mask[p] && !maskVisited[p]) {
+      maskVisited[p] = 1;
+      maskStack[sp++] = p;
+    }
+  };
+
+  for (let x = 0; x < w; x++) {
+    push(x);
+    push((h - 1) * w + x);
+  }
+  for (let y = 0; y < h; y++) {
+    push(y * w);
+    push(y * w + w - 1);
+  }
+
+  while (sp > 0) {
+    const p = maskStack[--sp];
+    const x = p % w;
+    const y = (p / w) | 0;
+    if (x > 0) push(p - 1);
+    if (x < w - 1) push(p + 1);
+    if (y > 0) push(p - w);
+    if (y < h - 1) push(p + w);
+  }
+
+  for (let p = 0; p < mask.length; p++) {
+    if (!mask[p] && !maskVisited[p]) mask[p] = 1;
+  }
+}
+
+/** minPixels 未満しかない孤立した塊を、ちらつきノイズとみなして消す */
+function removeSmallBlobs(mask, minPixels) {
+  const w = PROC_W;
+  const h = PROC_H;
+  maskVisited.fill(0);
+
+  for (let start = 0; start < mask.length; start++) {
+    if (!mask[start] || maskVisited[start]) continue;
+
+    let sp = 0;
+    let n = 0;
+    maskVisited[start] = 1;
+    maskStack[sp++] = start;
+
+    while (sp > 0) {
+      const p = maskStack[--sp];
+      maskBlobBuf[n++] = p;
+      const x = p % w;
+      const y = (p / w) | 0;
+      if (x > 0 && mask[p - 1] && !maskVisited[p - 1]) {
+        maskVisited[p - 1] = 1;
+        maskStack[sp++] = p - 1;
+      }
+      if (x < w - 1 && mask[p + 1] && !maskVisited[p + 1]) {
+        maskVisited[p + 1] = 1;
+        maskStack[sp++] = p + 1;
+      }
+      if (y > 0 && mask[p - w] && !maskVisited[p - w]) {
+        maskVisited[p - w] = 1;
+        maskStack[sp++] = p - w;
+      }
+      if (y < h - 1 && mask[p + w] && !maskVisited[p + w]) {
+        maskVisited[p + w] = 1;
+        maskStack[sp++] = p + w;
+      }
+    }
+
+    if (n < minPixels) {
+      for (let i = 0; i < n; i++) mask[maskBlobBuf[i]] = 0;
+    }
+  }
 }
 
 /** マスクを半透明の色オーバーレイとして小さい canvas に描画する */
@@ -602,10 +805,14 @@ function drawSilhouetteShadow() {
   renderMaskOverlay([r, g, b, 242]);
   ctx.save();
   ctx.imageSmoothingEnabled = true; // 拡大時に輪郭をなめらかにする
+  // マスクは低解像度(PROC_W x PROC_H)なので、そのまま拡大すると輪郭が
+  // カクカクする。軽くぼかして、投影された影らしい柔らかい輪郭にする。
+  ctx.filter = `blur(${Math.max(1, els.canvas.width / 400).toFixed(1)}px)`;
   ctx.shadowColor = `rgba(${gr}, ${gg}, ${gb}, 0.75)`;
   ctx.shadowBlur = 30;
   ctx.drawImage(maskCanvas, 0, 0, els.canvas.width, els.canvas.height);
   ctx.shadowBlur = 0;
+  ctx.filter = "none";
   ctx.restore();
 }
 
